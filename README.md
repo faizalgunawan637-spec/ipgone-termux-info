@@ -17,7 +17,7 @@ Tool ini memakai `libimobiledevice` (`idevice_id`, `idevicepair`, `ideviceinfo`)
 ```sh
 pkg update
 pkg install git
-git clone <url-repo-kamu> ipgone-termux-info
+git clone https://github.com/faizalgunawan637-spec/ipgone-termux-info.git
 cd ipgone-termux-info
 chmod +x install.sh bin/iphone-info scripts/doctor.sh
 ./install.sh
