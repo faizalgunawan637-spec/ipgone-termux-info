@@ -1,0 +1,228 @@
+#!/usr/bin/env bash
+set -Eeuo pipefail
+
+APP_NAME="iphone-info"
+PREFIX_DIR="${PREFIX:-/data/data/com.termux/files/usr}"
+LOCKDOWN_DIR="$PREFIX_DIR/var/lib/lockdown"
+RUN_DIR="$PREFIX_DIR/var/run"
+USBMUXD_LOG="${TMPDIR:-/data/data/com.termux/files/usr/tmp}/iphone-info-usbmuxd.log"
+
+MODE="summary"
+PAIR_FIRST=0
+START_USBMUXD=1
+UDID=""
+
+SUMMARY_KEYS=(
+  DeviceName
+  ProductName
+  ProductType
+  ProductVersion
+  BuildVersion
+  SerialNumber
+  UniqueDeviceID
+  ModelNumber
+  RegionInfo
+  TimeZone
+  WiFiAddress
+  BluetoothAddress
+  ActivationState
+)
+
+usage() {
+  cat <<'EOF'
+iphone-info - cek info iPhone dari Termux via kabel USB
+
+Usage:
+  iphone-info [options]
+
+Options:
+  -u, --udid <udid>     Pilih iPhone tertentu kalau ada lebih dari satu.
+  -p, --pair            Jalankan idevicepair pair sebelum baca info.
+  -r, --raw             Tampilkan semua output ideviceinfo.
+  -x, --xml             Tampilkan XML/plist dari ideviceinfo -x.
+      --no-usbmuxd      Jangan mencoba start usbmuxd otomatis.
+  -h, --help            Tampilkan bantuan.
+
+Contoh:
+  iphone-info --pair
+  iphone-info --raw
+  iphone-info -u 00008030-001A195E0E91802E
+EOF
+}
+
+say() {
+  printf '%s\n' "$*" >&2
+}
+
+die() {
+  say "ERROR: $*"
+  exit 1
+}
+
+have() {
+  command -v "$1" >/dev/null 2>&1
+}
+
+parse_args() {
+  while [[ $# -gt 0 ]]; do
+    case "$1" in
+      -u|--udid)
+        [[ $# -ge 2 ]] || die "Option $1 butuh nilai UDID."
+        UDID="$2"
+        shift 2
+        ;;
+      -p|--pair)
+        PAIR_FIRST=1
+        shift
+        ;;
+      -r|--raw)
+        MODE="raw"
+        shift
+        ;;
+      -x|--xml)
+        MODE="xml"
+        shift
+        ;;
+      --no-usbmuxd)
+        START_USBMUXD=0
+        shift
+        ;;
+      -h|--help)
+        usage
+        exit 0
+        ;;
+      *)
+        die "Option tidak dikenal: $1"
+        ;;
+    esac
+  done
+}
+
+check_dependencies() {
+  local missing=()
+  have idevice_id || missing+=("idevice_id")
+  have ideviceinfo || missing+=("ideviceinfo")
+  if [[ "$PAIR_FIRST" -eq 1 ]]; then
+    have idevicepair || missing+=("idevicepair")
+  fi
+
+  if [[ "${#missing[@]}" -gt 0 ]]; then
+    die "Command belum ada: ${missing[*]}. Install dengan: pkg install libimobiledevice usbmuxd"
+  fi
+}
+
+prepare_termux_dirs() {
+  mkdir -p "$LOCKDOWN_DIR" "$RUN_DIR" 2>/dev/null || true
+}
+
+start_usbmuxd_if_needed() {
+  [[ "$START_USBMUXD" -eq 1 ]] || return 0
+  have usbmuxd || return 0
+
+  if have pgrep && pgrep -x usbmuxd >/dev/null 2>&1; then
+    return 0
+  fi
+
+  say "Menjalankan usbmuxd..."
+  mkdir -p "$(dirname "$USBMUXD_LOG")" 2>/dev/null || true
+  : >"$USBMUXD_LOG" 2>/dev/null || true
+  usbmuxd -f >"$USBMUXD_LOG" 2>&1 &
+  sleep 2
+}
+
+list_udids() {
+  idevice_id -l 2>/dev/null | sed '/^[[:space:]]*$/d'
+}
+
+select_device() {
+  if [[ -n "$UDID" ]]; then
+    return 0
+  fi
+
+  local devices=()
+  mapfile -t devices < <(list_udids)
+
+  if [[ "${#devices[@]}" -eq 0 ]]; then
+    say "Tidak ada iPhone yang terdeteksi oleh idevice_id."
+    say ""
+    say "Coba langkah ini:"
+    say "  1. Pastikan HP Android support OTG/USB host."
+    say "  2. Pakai kabel data, bukan kabel charge-only."
+    say "  3. Unlock iPhone, lalu pilih Trust This Computer."
+    say "  4. Jalankan: scripts/doctor.sh"
+    if [[ -s "$USBMUXD_LOG" ]]; then
+      say ""
+      say "Log usbmuxd terakhir:"
+      tail -n 20 "$USBMUXD_LOG" >&2 || true
+    fi
+    exit 2
+  fi
+
+  if [[ "${#devices[@]}" -gt 1 ]]; then
+    say "Ada lebih dari satu iPhone. Pilih dengan --udid:"
+    printf '  %s\n' "${devices[@]}" >&2
+    exit 2
+  fi
+
+  UDID="${devices[0]}"
+}
+
+pair_device() {
+  [[ "$PAIR_FIRST" -eq 1 ]] || return 0
+  local idevice_args=()
+  [[ -n "$UDID" ]] && idevice_args=(-u "$UDID")
+
+  say "Mencoba pairing dengan iPhone..."
+  idevicepair "${idevice_args[@]}" pair
+}
+
+print_summary() {
+  local raw="$1"
+  local key value
+
+  printf 'UDID: %s\n' "$UDID"
+  for key in "${SUMMARY_KEYS[@]}"; do
+    value="$(
+      awk -F': ' -v wanted="$key" '
+        $1 == wanted {
+          sub(/^[^:]+: /, "")
+          print
+          exit
+        }
+      ' <<<"$raw"
+    )"
+    [[ -n "$value" ]] || continue
+    printf '%s: %s\n' "$key" "$value"
+  done
+}
+
+main() {
+  parse_args "$@"
+  check_dependencies
+  prepare_termux_dirs
+  start_usbmuxd_if_needed
+  select_device
+  pair_device
+
+  local idevice_args=()
+  [[ -n "$UDID" ]] && idevice_args=(-u "$UDID")
+
+  case "$MODE" in
+    raw)
+      ideviceinfo "${idevice_args[@]}"
+      ;;
+    xml)
+      ideviceinfo "${idevice_args[@]}" -x
+      ;;
+    summary)
+      local raw
+      raw="$(ideviceinfo "${idevice_args[@]}")"
+      print_summary "$raw"
+      ;;
+    *)
+      die "Mode internal tidak dikenal: $MODE"
+      ;;
+  esac
+}
+
+main "$@"
